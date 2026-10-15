@@ -1,11 +1,17 @@
 import streamlit as st
+import io
+import numpy as np
 
+from src import cache
 from src.pdf_processor import extract_text_from_pdf
 from src.embeddings import EmbeddingModel
 from src.vector_store import VectorStore
 from src.rag import build_context
 from src.gemini import GeminiClient
+from src.chunker import chunk_pages
 
+CHUNK_SIZE = 800
+CHUNK_OVERLAP = 150
 
 # ============================================================
 # PAGE CONFIG
@@ -13,7 +19,7 @@ from src.gemini import GeminiClient
 
 st.set_page_config(
     page_title="Multi PDF RAG",
-    page_icon="📚",
+    page_icon="",
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -449,88 +455,72 @@ with st.sidebar:
 # ============================================================
 
 if process_button:
-
     embedding_model = load_embedding_model()
 
     all_documents = []
-
+    all_embeddings = []
     total_pages = 0
+    cache_hits = 0
 
-    progress = st.progress(
-        0,
-        text="Preparing documents...",
-    )
+    progress = st.progress(0, text="Preparing documents...")
 
     for file_index, uploaded_file in enumerate(uploaded_files):
+        data = uploaded_file.getvalue()   # bytes, no stream cursor issues
+        key = cache.make_key(
+            data, embedding_model.model_name, CHUNK_SIZE, CHUNK_OVERLAP
+        )
 
-        pages = extract_text_from_pdf(uploaded_file)
+        cached = cache.load(key)
 
-        total_pages += len(pages)
-
-        for page in pages:
-
-            all_documents.append(
-                {
-                    "text": page["text"],
-                    "source": uploaded_file.name,
-                    "page": page["page"],
-                }
+        if cached:
+            chunks, embeddings = cached
+            # same content may have been uploaded under a different name
+            for chunk in chunks:
+                chunk["source"] = uploaded_file.name
+            cache_hits += 1
+            status = f"Loaded {uploaded_file.name} from cache"
+        else:
+            status = f"Embedding {uploaded_file.name}..."
+            progress.progress(
+                int(file_index / len(uploaded_files) * 100), text=status
             )
+            pages = extract_text_from_pdf(io.BytesIO(data))
+            chunks = chunk_pages(
+                pages, uploaded_file.name, CHUNK_SIZE, CHUNK_OVERLAP
+            )
+            if not chunks:
+                continue
+            embeddings = embedding_model.embed_documents(
+                [chunk["text"] for chunk in chunks]
+            )
+            cache.save(key, chunks, embeddings)
+
+        all_documents.extend(chunks)
+        all_embeddings.append(embeddings)
+        total_pages += len({chunk["page"] for chunk in chunks})
 
         progress.progress(
-            int(
-                ((file_index + 1) / len(uploaded_files))
-                * 100
-            ),
-            text=f"Processing {uploaded_file.name}...",
+            int((file_index + 1) / len(uploaded_files) * 100), text=status
         )
 
     if not all_documents:
-
-        st.error(
-            "No readable text was found in the uploaded PDFs."
-        )
-
+        progress.empty()
+        st.error("No readable text was found in the uploaded PDFs.")
     else:
-
-        progress.progress(
-            100,
-            text="Creating embeddings...",
-        )
-
-        texts = [
-            document["text"]
-            for document in all_documents
-        ]
-
-        embeddings = embedding_model.embed_documents(texts)
-
-        vector_store = VectorStore(
-            dimension=embeddings.shape[1]
-        )
-
-        vector_store.add_documents(
-            all_documents,
-            embeddings,
-        )
+        embeddings = np.vstack(all_embeddings)
+        vector_store = VectorStore(dimension=embeddings.shape[1])
+        vector_store.add_documents(all_documents, embeddings)
 
         st.session_state.vector_store = vector_store
         st.session_state.documents = all_documents
-
         st.session_state.stats = {
             "pdfs": len(uploaded_files),
             "pages": total_pages,
             "chunks": len(all_documents),
         }
-
         st.session_state.messages = []
 
         progress.empty()
-
-        st.success(
-            f"Successfully indexed {len(all_documents)} document sections."
-        )
-
         st.rerun()
 
 
